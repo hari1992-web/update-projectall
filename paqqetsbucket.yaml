@@ -1,0 +1,29 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  training bucket
+
+Resources:
+  AdminPortalS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: PublicRead
+      BucketName: trainingtest
+      MetricsConfigurations:
+        - Id: EntireBucket
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+    DeletionPolicy: Retain
+
+  BucketPolicyPrivate:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: trainingtest
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Principal: '*'
+          Action: 's3:GetObject*'
+          Effect: Allow
+          Resource: !Sub '${AdminPortalS3Bucket.Arn}/*'

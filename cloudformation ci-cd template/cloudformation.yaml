@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  CodeCommitRepo:
+    Description: Name of CodeCommit Repo
+    Type: String
+    Default: sam
+  CodeCommitBranch:
+    Description: Name of CodeCommit Branch
+    Type: String
+    Default: master
+  DeploymentBucket:
+    Description: Name of Deployment Bucket
+    Type: String
+    Default: sentinelconnectreactappp 
+  ArtifcatsBucket:
+    Description: Name of Deployment Bucket
+    Type: String
+    Default: codepipelinebucketreactappp
+
+Resources:
+  CodePipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      RoleArn: !GetAtt CodePipeLineRole.Arn
+      ArtifactStore:
+        Location: !Ref PipelineBucket
+        Type: S3
+      Stages:
+        - 
+          Name: Source
+          Actions: 
+            - 
+              Name: SourceAction
+              ActionTypeId: 
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit	
+                Version: 1
+              OutputArtifacts: 
+                - 
+                  Name: MyApp
+              Configuration:                
+                BranchName: !Ref CodeCommitBranch
+                PollForSourceChanges: 'false'
+                RepositoryName: !Ref CodeCommitRepo
+        - 
+          Name: Build
+          Actions: 
+            - 
+              Name: BuildAction
+              ActionTypeId: 
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts: 
+                - 
+                  Name: MyApp
+              OutputArtifacts: 
+                - 
+                  Name: MyAppBuild
+              Configuration:
+                ProjectName: !Ref CodeBuild
+        - 
+          Name: Deploy
+          Actions: 
+            - 
+              Name: DeployAction
+              ActionTypeId: 
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: S3
+              InputArtifacts: 
+                - 
+                  Name: MyAppBuild  
+              Configuration:                
+                BucketName: !Ref DeployBucket 
+                Extract: 'true'              
+      Tags:
+        - Key: Name
+          Value: sentinelconnectPipeline
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - 
+            Effect: Allow
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /service-role/
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement: 
+              - 
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:ListBucket"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject"
+                  - "s3:PutObjectAcl"
+                  - "s3:PutObjectVersionAcl"
+                Resource: 
+                  - !GetAtt PipelineBucket.Arn
+                  - !Join ['', [!GetAtt PipelineBucket.Arn, "/*"]]
+              - 
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                  - "s3:PutObjectAcl"
+                  - "s3:PutObjectVersionAcl"
+                Resource: 
+                  - !GetAtt DeployBucket.Arn
+                  - !Join ['', [!GetAtt DeployBucket.Arn, "/*"]]
+              -
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "cloudfront:CreateInvalidation"
+                Resource:
+                  - "*"
+      Tags:
+        - Key: Name
+          Value: sentinelconnectCodeBuildRole
+  CodePipeLineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - 
+            Effect: Allow
+            Principal:
+              Service:
+                - "codepipeline.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement: 
+              - 
+                Effect: Allow
+                Action:
+                  - "s3:GetObject" 
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject"             
+                Resource: 
+                  - !GetAtt PipelineBucket.Arn
+                  - !Join ['', [!GetAtt PipelineBucket.Arn, "/*"]]
+                  - !Sub 'arn:aws:s3:::${DeployBucket}/*'
+              - Effect: Allow
+                Action:
+                - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${DeployBucket}/*'
+              - 
+                Effect: Allow  
+                Action:
+                  - "codebuild:BatchGetBuilds"
+                  - "codebuild:StartBuild"
+                Resource: "*"
+              - 
+                Effect: Allow  
+                Action:
+                  - "codecommit:GetRepository"
+                  - "codecommit:GetBranch"
+                  - "codecommit:GetCommit"
+                  - "codecommit:UploadArchive"
+                  - "codecommit:GetUploadArchiveStatus"
+                  - "codecommit:CancelUploadArchive"
+                Resource: "*"                
+      Tags:
+        - Key: Name
+          Value: sentinelconnectCodePipeLineRole
+  CodeBuild:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub ${AWS::StackName}-CodeBuild
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+        Name: MyProject
+      Source: 
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:4.0
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                 nodejs: 12
+            pre_build:
+              commands:
+                - echo Installing source NPM dependencies...
+                - cd webapp && rm -rf node_modules && rm package-lock.json && npm cache clear --force && npm install -g jest && apt-get install libfontconfig && npm install --save react-scripts@3.3.0 && npm install
+            build:
+              commands:
+                - echo Build started on `date`
+                - npm run build:dev
+            post_build:
+              commands:
+               - mkdir -p build
+               - aws s3 rm s3://${DeploymentBucket} --recursive
+               - ls -l
+          artifacts:
+            files:
+              - '**/*'
+            base-directory: 'webapp/build'
+      Tags:
+        - Key: Name
+          Value: sentinelconnectCodeBuildProject
+  PipelineBucket: 
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref ArtifcatsBucket
+  DeployBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref DeploymentBucket
+      MetricsConfigurations:
+        - Id: EntireBucket
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      AccessControl: PublicRead
+      CorsConfiguration:
+        CorsRules:
+        - AllowedOrigins: ['*']
+          AllowedMethods: [GET]
+    DeletionPolicy: Retain
+  
+  PrivateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DeployBucket
+      PolicyDocument:
+        Statement:
+          -
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${DeployBucket}/*'
+
+
+Outputs:
+  SiteUrl:
+    Value: !GetAtt [DeployBucket, WebsiteURL]
+    Description: S3 Website URL
+  S3BucketSecureURL:
+    Value: !Join ["", ["https://", !GetAtt [DeployBucket, DomainName]]]
+    Description: Name of S3 bucket to hold website content

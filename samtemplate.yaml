@@ -1,0 +1,2661 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SentinelConnect
+
+  SAM Template for SentinelConnect
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 20
+
+Parameters:
+  ApiName:
+    Type: String
+    Default: SentinelConnectApi
+    Description: This is sentinelconnectApi
+  AdminWebApiGatewayStageName:
+    Type: "String"
+    AllowedPattern: "^[a-z0-9A-Z]+$"
+    Default: "QA"
+  AdminWebUIBucketName:
+    Description: Name of the S3 bucket used to host the Sentinel Connect Admin Portal
+    Type: String
+    MinLength: 8
+    MaxLength: 63
+  CreateWebUIBucket:
+    AllowedValues:
+        - 'true'
+        - 'false'
+    Default: 'false'
+    Type: String
+  IamRoleName:
+    Description: Name of the Iam Role used to the Sentinel Connect
+    Type: String
+    Default: SentinelConnectAccessRole
+  validatorName:
+    Type: String
+    Default: Validate body, query string parameters, and headers
+  validateRequestBody:
+    Type: String
+    Default: validateRequestBody
+  UserName:
+    Type: String
+  Email:
+    Type: String
+  PhoneNo:
+    Type: String
+  Name:
+    Type: String
+  TableName: 
+    Type: String
+    Default: SystemConfig
+  DynamoDBSNSEmail:
+    Description : Email Address subscribed to DynamoDB capacity monitoring SNS Topic
+    Type: String
+    AllowedPattern: "^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+$"
+    MinLength: 1
+    MaxLength: 255
+  AutoScalingMaxReadCapacity:
+    Description : Maximum value of read capacity in dynamodb tables auto scaling
+    Type: Number
+    Default: 50
+    MinLength: 1
+    MaxLength: 40000
+  AutoScalingMinReadCapacity:
+    Description : Minimum value of read capacity in dynamodb tables auto scaling
+    Type: Number
+    Default: 5
+    MinLength: 1
+    MaxLength: 40000
+  AutoScalingReadTargetUtilization:
+    Description : Target Utilization in percentage for read capacity in dynamodb tables auto scaling
+    Type: Number
+    Default: 50.0
+    MinLength: 1
+    MaxLength: 100
+  AutoScalingMaxWriteCapacity:
+    Description : Maximum value of write capacity in dynamodb tables auto scaling
+    Type: Number
+    Default: 50
+    MinLength: 1
+    MaxLength: 40000
+  AutoScalingMinWriteCapacity:
+    Description : Minimum value of write capacity in dynamodb tables auto scaling
+    Type: Number
+    Default: 5
+    MinLength: 1
+    MaxLength: 40000
+  AutoScalingWriteTargetUtilization:
+    Description : Target Utilization in percentage for write capacity in dynamodb tables auto scaling
+    Type: Number
+    Default: 50.0
+    MinLength: 1
+    MaxLength: 100
+
+Conditions:
+  EnableWebUIBucketCreation: !Equals [!Ref CreateWebUIBucket, 'true']
+
+Resources:
+ 
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Cognito Infrastructure                                                       #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+  
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: SentinelConnectCognitoUserPool
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 6
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+        - Name: phone_number
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: Role
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+        - Name: ClientId
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: SentinelConnectCognitoClient
+      GenerateSecret: false
+
+  CognitoIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: SentinelConnectCognitoIdentityPool
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId:
+            Ref: CognitoUserPoolClient
+          ProviderName:
+            Fn::GetAtt: [CognitoUserPool, ProviderName]
+
+  CognitoIdentityPoolRoles:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId:
+        Ref: CognitoIdentityPool
+      Roles:
+        authenticated:
+          Fn::GetAtt: [CognitoAuthRole, Arn]
+        unauthenticated:
+          Fn::GetAtt: [CognitoUnauthRole, Arn]
+         
+
+  CognitoAuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join [ "", [ !Ref AWS::Region, "SentinelConnectCognitoAppAuthRole"] ]
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action:
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud":
+                  Ref: CognitoIdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Policies:
+        - PolicyName: "CognitoAuthorizedPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "mobileanalytics:PutEvents"
+                  - "cognito-sync:*"
+                  - "cognito-identity:*"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "execute-api:Invoke"
+                Resource: "*"
+
+  CognitoUnauthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join [ "", [ !Ref AWS::Region, "SentinelConnectCognitoAppUnauthRole"] ]
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action:
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud":
+                  Ref: CognitoIdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": unauthenticated
+      Policies:
+        - PolicyName: "CognitoUnauthorizedPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "mobileanalytics:PutEvents"
+                  - "cognito-sync:*"
+                  - "cognito-identity:*"
+                Resource: "*"
+
+  
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect DynamoDB Infrastructure                                                      #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+  # SNS topic
+  DynamoDBMonitoringSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties: 
+      Subscription: 
+        - Endpoint: !Ref DynamoDBSNSEmail
+          Protocol: email
+      TopicName: SentinelConnectDynamoDBCapacityMonitoring
+
+  # IAM role for AutoScailing 
+  DynamoDBScalingRole: 
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join [ "", [ !Ref AWS::Region, "SentinelConnectDynamoDBScailingRole"] ]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - application-autoscaling.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "dynamodb:DescribeTable"
+                  - "dynamodb:UpdateTable"
+                  - "cloudwatch:PutMetricAlarm"
+                  - "cloudwatch:DescribeAlarms"
+                  - "cloudwatch:GetMetricStatistics"
+                  - "cloudwatch:SetAlarmState"
+                  - "cloudwatch:DeleteAlarms"
+                Resource: "*"
+
+  ClientDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Client
+      AttributeDefinitions:
+        - AttributeName: Region
+          AttributeType: S
+        - AttributeName: GUID
+          AttributeType: S
+        - AttributeName: Name
+          AttributeType: S
+        - AttributeName: ServiceAccountId
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: Region
+          KeyType: HASH
+        - AttributeName: GUID
+          KeyType: RANGE
+
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+      LocalSecondaryIndexes:
+        - IndexName: Region-ServiceAccountId-index
+          KeySchema:
+            - AttributeName: Region
+              KeyType: HASH
+            - AttributeName: ServiceAccountId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL # Make All columns available in index
+        - IndexName: Region-Name-index
+          KeySchema:
+            - AttributeName: Region
+              KeyType: HASH
+            - AttributeName: Name
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL # Make All columns available in index
+  
+  ClientTableWriteCapacityScalableTarget: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref AutoScalingMaxWriteCapacity
+      MinCapacity: !Ref AutoScalingMinWriteCapacity
+      ResourceId: !Join
+        - /
+        - - table
+          - !Ref ClientDynamoDBTable # Table Name
+      RoleARN: !GetAtt DynamoDBScalingRole.Arn
+      ScalableDimension: dynamodb:table:WriteCapacityUnits
+      ServiceNamespace: dynamodb
+
+  ClientTableWriteCapacityScalingPolicy: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ClientTableWriteCapacityAutoScalingPolicy # Policy Name
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ClientTableWriteCapacityScalableTarget # Target Name
+      TargetTrackingScalingPoltion:
+        TargetValue: !Ref AutoScalingWriteTargetUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBWriteCapacityUtilization
+
+  ClientTableMaxWriteCapAlarm: # Resource Name
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SentinelConnectClientTableMaxWriteCapAlarm' # Alarm Name
+      AlarmDescription: 'Alarm when table provisioned write capacity exceeds 80% of maximum autoscaling  write capacity' # Alarm Desc
+      AlarmActions:
+        - !Ref DynamoDBMonitoringSNSTopic
+      Metrics:
+        - Id: 'e1'
+          Expression: '(m1/${AutoScalingMaxWriteCapacity})*100'
+          Label: MaximumClientTableWrites # Metric Label
+        - Id: 'm1'
+          MetricStat:
+            Metric:
+              Namespace: 'AWS/DynamoDB'
+              MetricName: 'ProvisionedWriteCapacityUnits' # Metric Name
+              Dimensions:
+                - Name: 'TableName'
+                  Value: !Ref ClientDynamoDBTable # Table Name
+            Period: 60 
+            Stat: 'SampleCount'
+            Unit: 'Count'
+          ReturnData: False
+      EvaluationPeriods: 2
+      Threshold: 80.0
+      ComparisonOperator: 'GreaterThanThreshold'
+  
+  ClientTableReadCapacityScalableTarget: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref AutoScalingMaxReadCapacity
+      MinCapacity: !Ref AutoScalingMinReadCapacity
+      ResourceId: !Join
+        - /
+        - - table
+          - !Ref ClientDynamoDBTable # Table Name
+      RoleARN: !GetAtt DynamoDBScalingRole.Arn
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  ClientTableReadCapacityScalingPolicy: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ClientTableReadCapacityAutoScalingPolicy # Policy Name
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ClientTableReadCapacityScalableTarget # Target Name
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref AutoScalingReadTargetUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBReadCapacityUtilization
+
+  ClientTableMaxReadCapAlarm: # Resource Name
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SentinelConnectClientTableMaxReadCapAlarm' # Alarm Name
+      AlarmDescription: 'Alarm when table provisioned read capacity exceeds 80% of maximum autoscaling read capacity' # Alarm Desc
+      AlarmActions:
+        - !Ref DynamoDBMonitoringSNSTopic
+      Metrics:
+        - Id: 'e1'
+          Expression: '(m1/${AutoScalingMaxReadCapacity})*100'
+          Label: MaximumClientTableReads # Metric Label
+        - Id: 'm1'
+          MetricStat:
+            Metric:
+              Namespace: 'AWS/DynamoDB'
+              MetricName: 'ProvisionedReadCapacityUnits'
+              Dimensions:
+                - Name: 'TableName'
+                  Value: !Ref ClientDynamoDBTable # Table Name
+            Period: 60 
+            Stat: 'SampleCount'
+            Unit: 'Count'
+          ReturnData: False
+      EvaluationPeriods: 2
+      Threshold: 80.0
+      ComparisonOperator: 'GreaterThanThreshold'
+
+  MessageDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Message
+      AttributeDefinitions:
+        - AttributeName: MessageType
+          AttributeType: S
+        - AttributeName: TimeStamp
+          AttributeType: S
+        - AttributeName: ClientId
+          AttributeType: S
+        - AttributeName: ExternalId
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: MessageType
+          KeyType: HASH
+        - AttributeName: TimeStamp
+          KeyType: RANGE
+
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+      LocalSecondaryIndexes:
+        - IndexName: MessageType-ClientId-index
+          KeySchema:
+            - AttributeName: MessageType
+              KeyType: HASH
+            - AttributeName: ClientId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL # Make All columns available in index
+        - IndexName: MessageType-ExternalId-index
+          KeySchema:
+            - AttributeName: MessageType
+              KeyType: HASH
+            - AttributeName: ExternalId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL # Make All columns available in index
+        
+      GlobalSecondaryIndexes:
+        - IndexName: ClientId-TimeStamp-index
+          KeySchema:
+            - AttributeName: ClientId
+              KeyType: HASH
+            - AttributeName: TimeStamp
+              KeyType: RANGE
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+          Projection:
+           ProjectionType: ALL
+
+  MessageTableWriteCapacityScalableTarget: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref AutoScalingMaxWriteCapacity
+      MinCapacity: !Ref AutoScalingMinWriteCapacity
+      ResourceId: !Join
+        - /
+        - - table
+          - !Ref MessageDynamoDBTable # Table Name
+      RoleARN: !GetAtt DynamoDBScalingRole.Arn
+      ScalableDimension: dynamodb:table:WriteCapacityUnits
+      ServiceNamespace: dynamodb
+
+  MessageTableWriteCapacityScalingPolicy: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: MessageTableWriteCapacityAutoScalingPolicy # Policy Name
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref MessageTableWriteCapacityScalableTarget # Target Name
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref AutoScalingWriteTargetUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBWriteCapacityUtilization
+
+  MessageTableMaxWriteCapAlarm: # Resource Name
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SentinelConnectMessageTableMaxWriteCapAlarm' # Alarm Name
+      AlarmDescription: 'Alarm when table provisioned write capacity exceeds 80% of maximum autoscaling  write capacity' # Alarm Desc
+      AlarmActions:
+        - !Ref DynamoDBMonitoringSNSTopic
+      Metrics:
+        - Id: 'e1'
+          Expression: '(m1/${AutoScalingMaxWriteCapacity})*100'
+          Label: MaximumMessageTableWrites # Metric Label
+        - Id: 'm1'
+          MetricStat:
+            Metric:
+              Namespace: 'AWS/DynamoDB'
+              MetricName: 'ProvisionedWriteCapacityUnits' # Metric Name
+              Dimensions:
+                - Name: 'TableName'
+                  Value: !Ref MessageDynamoDBTable # Table Name
+            Period: 60 
+            Stat: 'SampleCount'
+            Unit: 'Count'
+          ReturnData: False
+      EvaluationPeriods: 2
+      Threshold: 80.0
+      ComparisonOperator: 'GreaterThanThreshold'
+  
+  MessageTableReadCapacityScalableTarget: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref AutoScalingMaxReadCapacity
+      MinCapacity: !Ref AutoScalingMinReadCapacity
+      ResourceId: !Join
+        - /
+        - - table
+          - !Ref MessageDynamoDBTable # Table Name
+      RoleARN: !GetAtt DynamoDBScalingRole.Arn
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  MessageTableReadCapacityScalingPolicy: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: MessageTableReadCapacityAutoScalingPolicy # Policy Name
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref MessageTableReadCapacityScalableTarget # Target Name
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref AutoScalingReadTargetUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBReadCapacityUtilization
+
+  MessageTableMaxReadCapAlarm: # Resource Name
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SentinelConnectMessageTableMaxReadCapAlarm' # Alarm Name
+      AlarmDescription: 'Alarm when table provisioned read capacity exceeds 80% of maximum autoscaling read capacity' # Alarm Desc
+      AlarmActions:
+        - !Ref DynamoDBMonitoringSNSTopic
+      Metrics:
+        - Id: 'e1'
+          Expression: '(m1/${AutoScalingMaxReadCapacity})*100'
+          Label: MaximumMessageTableReads # Metric Label
+        - Id: 'm1'
+          MetricStat:
+            Metric:
+              Namespace: 'AWS/DynamoDB'
+              MetricName: 'ProvisionedReadCapacityUnits'
+              Dimensions:
+                - Name: 'TableName'
+                  Value: !Ref MessageDynamoDBTable # Table Name
+            Period: 60 
+            Stat: 'SampleCount'
+            Unit: 'Count'
+          ReturnData: False
+      EvaluationPeriods: 2
+      Threshold: 80.0
+      ComparisonOperator: 'GreaterThanThreshold'
+
+  MessageTableIndexWriteCapacityScalableTarget: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref AutoScalingMaxWriteCapacity
+      MinCapacity: !Ref AutoScalingMinWriteCapacity
+      ResourceId: !Join
+        - /
+        - - table
+          - !Ref MessageDynamoDBTable # Table Name
+          - index
+          - ClientId-TimeStamp-index
+      RoleARN: !GetAtt DynamoDBScalingRole.Arn
+      ScalableDimension: dynamodb:index:WriteCapacityUnits
+      ServiceNamespace: dynamodb
+
+  MessageTableIndexWriteCapacityScalingPolicy: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: MessageTableIndexWriteCapacityAutoScalingPolicy # Policy Name
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref MessageTableIndexWriteCapacityScalableTarget # Target Name
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref AutoScalingWriteTargetUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBWriteCapacityUtilization
+
+  MessageTableIndexMaxWriteCapAlarm: # Resource Name
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SentinelConnectMessageTableMaxWriteCapAlarm' # Alarm Name
+      AlarmDescription: 'Alarm when table provisioned write capacity exceeds 80% of maximum autoscaling  write capacity' # Alarm Desc
+      AlarmActions:
+        - !Ref DynamoDBMonitoringSNSTopic
+      Metrics:
+        - Id: 'e1'
+          Expression: '(m1/${AutoScalingMaxWriteCapacity})*100'
+          Label: MaximumMessageTableWrites # Metric Label
+        - Id: 'm1'
+          MetricStat:
+            Metric:
+              Namespace: 'AWS/DynamoDB'
+              MetricName: 'ProvisionedWriteCapacityUnits' # Metric Name
+              Dimensions:
+                - Name: 'TableName'
+                  Value: !Ref MessageDynamoDBTable # Table Name
+                - Name: 'GlobalSecondaryIndexName'
+                  Value: 'ClientId-TimeStamp-index'
+            Period: 60 
+            Stat: 'SampleCount'
+            Unit: 'Count'
+          ReturnData: False
+      EvaluationPeriods: 2
+      Threshold: 80.0
+      ComparisonOperator: 'GreaterThanThreshold'
+  
+  MessageTableIndexReadCapacityScalableTarget: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref AutoScalingMaxReadCapacity
+      MinCapacity: !Ref AutoScalingMinReadCapacity
+      ResourceId: !Join
+        - /
+        - - table
+          - !Ref MessageDynamoDBTable # Table Name
+          - index
+          - ClientId-TimeStamp-index
+      RoleARN: !GetAtt DynamoDBScalingRole.Arn
+      ScalableDimension: dynamodb:index:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  MessageTableIndexReadCapacityScalingPolicy: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: MessageTableIndexReadCapacityAutoScalingPolicy # Policy Name
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref MessageTableIndexReadCapacityScalableTarget # Target Name
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref AutoScalingReadTargetUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBReadCapacityUtilization
+
+  MessageTableIndexMaxReadCapAlarm: # Resource Name
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SentinelConnectMessageTableMaxReadCapAlarm' # Alarm Name
+      AlarmDescription: 'Alarm when table provisioned Read capacity exceeds 80% of maximum autoscaling Read capacity' # Alarm Desc
+      AlarmActions:
+        - !Ref DynamoDBMonitoringSNSTopic
+      Metrics:
+        - Id: 'e1'
+          Expression: '(m1/${AutoScalingMaxReadCapacity})*100'
+          Label: MaximumMessageTableReads # Metric Label
+        - Id: 'm1'
+          MetricStat:
+            Metric:
+              Namespace: 'AWS/DynamoDB'
+              MetricName: 'ProvisionedReadCapacityUnits' # Metric Name
+              Dimensions:
+                - Name: 'TableName'
+                  Value: !Ref MessageDynamoDBTable # Table Name
+                - Name: 'GlobalSecondaryIndexName'
+                  Value: 'ClientId-TimeStamp-index'
+            Period: 60 
+            Stat: 'SampleCount'
+            Unit: 'Count'
+          ReturnData: False
+      EvaluationPeriods: 2
+      Threshold: 80.0
+      ComparisonOperator: 'GreaterThanThreshold'
+
+  SystemConfigDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SystemConfig
+      AttributeDefinitions:
+        - AttributeName: System
+          AttributeType: S
+        - AttributeName: Version
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: System
+          KeyType: HASH
+        - AttributeName: Version
+          KeyType: RANGE
+
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  SystemConfigTableWriteCapacityScalableTarget: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref AutoScalingMaxWriteCapacity
+      MinCapacity: !Ref AutoScalingMinWriteCapacity
+      ResourceId: !Join
+        - /
+        - - table
+          - !Ref SystemConfigDynamoDBTable # Table Name
+      RoleARN: !GetAtt DynamoDBScalingRole.Arn
+      ScalableDimension: dynamodb:table:WriteCapacityUnits
+      ServiceNamespace: dynamodb
+
+  SystemConfigTableWriteCapacityScalingPolicy: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: SystemConfigTableWriteCapacityAutoScalingPolicy # Policy Name
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref SystemConfigTableWriteCapacityScalableTarget # Target Name
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref AutoScalingWriteTargetUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBWriteCapacityUtilization
+
+  SystemConfigTableMaxWriteCapAlarm: # Resource Name
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SentinelConnectSystemConfigTableMaxWriteCapAlarm' # Alarm Name
+      AlarmDescription: 'Alarm when system config table provisioned write capacity exceeds 80% of maximum autoscaling write capacity' # Alarm Desc
+      AlarmActions:
+        - !Ref DynamoDBMonitoringSNSTopic
+      Metrics:
+        - Id: 'e1'
+          Expression: '(m1/${AutoScalingMaxWriteCapacity})*100'
+          Label: MaximumSystemConfigTableWrites # Metric Label
+        - Id: 'm1'
+          MetricStat:
+            Metric:
+              Namespace: 'AWS/DynamoDB'
+              MetricName: 'ProvisionedWriteCapacityUnits' # Metric Name
+              Dimensions:
+                - Name: 'TableName'
+                  Value: !Ref SystemConfigDynamoDBTable # Table Name
+            Period: 60 
+            Stat: 'SampleCount'
+            Unit: 'Count'
+          ReturnData: False
+      EvaluationPeriods: 2
+      Threshold: 80.0
+      ComparisonOperator: 'GreaterThanThreshold'
+  
+  SystemConfigTableReadCapacityScalableTarget: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref AutoScalingMaxReadCapacity
+      MinCapacity: !Ref AutoScalingMinReadCapacity
+      ResourceId: !Join
+        - /
+        - - table
+          - !Ref SystemConfigDynamoDBTable # Table Name
+      RoleARN: !GetAtt DynamoDBScalingRole.Arn
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  SystemConfigTableReadCapacityScalingPolicy: # Resource Name
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: SystemConfigTableReadCapacityAutoScalingPolicy # Policy Name
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref SystemConfigTableReadCapacityScalableTarget # Target Name
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref AutoScalingReadTargetUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBReadCapacityUtilization
+
+  SystemConfigTableMaxReadCapAlarm: # Resource Name
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SentinelConnectSystemConfigTableMaxReadCapAlarm' # Alarm Name
+      AlarmDescription: 'Alarm when table provisioned read capacity exceeds 80% of maximum autoscaling read capacity' # Alarm Desc
+      AlarmActions:
+        - !Ref DynamoDBMonitoringSNSTopic
+      Metrics:
+        - Id: 'e1'
+          Expression: '(m1/${AutoScalingMaxReadCapacity})*100'
+          Label: MaximumSystemConfigTableReads # Metric Label
+        - Id: 'm1'
+          MetricStat:
+            Metric:
+              Namespace: 'AWS/DynamoDB'
+              MetricName: 'ProvisionedReadCapacityUnits'
+              Dimensions:
+                - Name: 'TableName'
+                  Value: !Ref SystemConfigDynamoDBTable # Table Name
+            Period: 60 
+            Stat: 'SampleCount'
+            Unit: 'Count'
+          ReturnData: False
+      EvaluationPeriods: 2
+      Threshold: 80.0
+      ComparisonOperator: 'GreaterThanThreshold'
+
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Policy and Role Infrastructure                                               #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+    
+  SentinelConnectDynamoDBAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Managed policy to allow SentinelConnect to access the DynamoDB tables created by this template.
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:DeleteItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:BatchGetItem
+              - dynamodb:BatchWriteItem
+              - dynamodb:ConditionCheckItem
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+            Resource:
+              - !Join ["",[!GetAtt ClientDynamoDBTable.Arn]]
+              - !Join ["",[!GetAtt MessageDynamoDBTable.Arn]]
+              - !Join ["",[!GetAtt SystemConfigDynamoDBTable.Arn]]
+              - !Join ["",[!Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Client/index/*']]
+              - !Join ["",[!Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Message/index/*']]
+             
+
+  SentinelConnectCognitoAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Managed policy to allow SentinelConnect to access the Cognito UserPool created by this template.
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - cognito-idp:AdminGetUser
+              - cognito-idp:AdminDeleteUser
+              - cognito-idp:AdminInitiateAuth
+              - cognito-idp:AdminEnableUser
+              - cognito-idp:AdminCreateUser
+              - cognito-idp:AdminDisableUser
+              - cognito-idp:AdminUpdateUserAttributes
+              - cognito-idp:AdminRespondToAuthChallenge
+              - cognito-idp:ListUsers
+            Resource: !GetAtt CognitoUserPool.Arn
+
+  SentinelConnectAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join [ "", [ !Ref AWS::Region, !Ref IamRoleName] ]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+        - arn:aws:iam::aws:policy/AWSLambdaInvocation-DynamoDB
+        - !Ref SentinelConnectDynamoDBAccessPolicy
+        - !Ref SentinelConnectCognitoAccessPolicy
+    DependsOn:
+      - SentinelConnectDynamoDBAccessPolicy
+      - SentinelConnectCognitoAccessPolicy
+ 
+
+  
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Service API Infrastructure                                                   #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+  
+  # SentinelConnect Service API
+  SentinelConnectServiceApi:
+    DependsOn: CognitoUserPool
+    Description: A ServerlessApi for Sentinel Connect Service Portal
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: v1
+      EndpointConfiguration: REGIONAL
+      Name: !Ref ApiName
+      Cors:
+         AllowMethods: "'*'"
+         AllowHeaders: "'*'"
+         AllowOrigin: "'*'"
+      Auth:
+        Authorizers:
+           SentinalConnectServiceCognitoAuthorizer:
+              UserPoolArn: !GetAtt "CognitoUserPool.Arn"
+        AddDefaultAuthorizerToCorsPreflight: False
+        
+    
+  SentinelConnectServiceApiRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      Name: !Ref validatorName
+      RestApiId: !Ref SentinelConnectServiceApi
+      ValidateRequestBody: true
+
+  
+  SentinelConnectServiceApiGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'*'"
+      ResponseTemplates:
+             "application/json": '{ "status": "PROCESSING", "message": "Please come back with same GUID, it may take some time to process." }'
+      ResponseType: INTEGRATION_TIMEOUT
+      RestApiId: !Ref SentinelConnectServiceApi
+      StatusCode: '202' 
+
+  SentinelConnectServiceApiGatewayResponseAccessToken:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'*'"
+      ResponseTemplates:
+             "application/json": '{ "status": "EXPIRED TOKEN", "message":"Access token has expired or is empty." }'
+      ResponseType: EXPIRED_TOKEN
+      RestApiId: !Ref SentinelConnectServiceApi
+      StatusCode: '401' 
+
+  
+  SentinelConnectServiceApiGatewayModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      ContentType: 'application/json'
+      RestApiId: !Ref SentinelConnectServiceApi
+      Name: SentinelConnectApiGatewayModel
+      Schema: {}
+
+  
+  #SentinelConnect Layers
+  CustomerAndContactLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleRuntimes: List
+      ContentUri: api/service/layers/SentinelConnect-Service-CustomerAndContact
+      CompatibleRuntimes:
+         - nodejs12.x
+      Description: My SentinelConnect-Service-CustomerAndContact lamda layers
+      LayerName: SentinelConnect-Service-CustomerAndContact
+      LicenseInfo: "avilable"
+      RetentionPolicy: Delete
+
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleRuntimes: List
+      ContentUri: api/service/layers/SentinelConnect-Service-Dependencies
+      CompatibleRuntimes:
+         - nodejs12.x
+      Description: My lamda SentinelConnect-Service-Dependencies layers
+      LayerName: SentinelConnect-Service-Dependencies
+      LicenseInfo: "avilable"
+      RetentionPolicy: Delete    
+
+  ServicePartnerLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleRuntimes: List
+      ContentUri: api/service/layers/SentinelConnect-Service-Partner
+      CompatibleRuntimes:
+         - nodejs12.x
+      Description: My lamda SentinelConnect-Service-Partner layers
+      LayerName: SentinelConnect-Service-Partner
+      LicenseInfo: "avilable"
+      RetentionPolicy: Delete    
+
+  ServiceProductLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleRuntimes: List
+      ContentUri: api/service/layers/SentinelConnect-Service-Product  
+      CompatibleRuntimes:
+         - nodejs12.x
+      Description: My lamda SentinelConnect-Service-Product layers
+      LayerName: SentinelConnect-Service-Product
+      LicenseInfo: "avilable"
+      RetentionPolicy: Delete
+
+  
+  #SentinelConnect Service Lambdas
+
+  SentinelConnectServiceAuthenticationToken:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/service/Auth/SentinelConnect-Service-AuthToken
+      FunctionName: SentinelConnect-Service-AuthToken
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          ClientId: !Ref CognitoUserPoolClient
+          UserPoolId: !Ref CognitoUserPool
+      Events:     
+        token:
+           Type: Api
+           Properties:
+             Path: /token
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+
+  SentinelConnectServiceCreateEntitlement:  
+    Type: "AWS::Serverless::Function"
+    Properties:
+      FunctionName: SentinelConnect-Service-CreateEntitlement
+      Handler: index.handler
+      Runtime: nodejs12.x 
+      Layers:
+         - !Ref CustomerAndContactLayer
+         - !Ref DependenciesLayer
+         - !Ref ServicePartnerLayer
+         - !Ref ServiceProductLayer
+      CodeUri: api/service/lambdas/SentinelConnect-Service-CreateEntitlement
+      Description: "SentinelConnectServiceCreateentitlement function"      
+      MemorySize: 128      
+      Timeout: 20      
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+   
+  SentinelConnectServiceExecutionFlow:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-ExecutionFlow
+       Description: SentinelConnectServiceExecutionFlow Function 
+       CodeUri: api/service/lambdas/SentinelConnect-Service-ExecutionFlow
+       MemorySize: 128
+       Timeout: 60
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Layers:
+         - !Ref CustomerAndContactLayer
+         - !Ref DependenciesLayer
+         - !Ref ServicePartnerLayer
+         - !Ref ServiceProductLayer
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Events:
+         activation:
+           Type: Api
+           Properties:
+             Path: /activation
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+             RequestParameters:
+              - method.request.header.authorization:
+                  Required: true
+              - method.request.header.guid:
+                  Required: true 
+             Auth:
+               Authorizer: SentinalConnectServiceCognitoAuthorizer
+         entitlement:
+            Type: Api
+            Properties:
+              Path: /entitlement
+              RestApiId: !Ref SentinelConnectServiceApi
+              Method: GET
+              Auth:
+                Authorizer: SentinalConnectServiceCognitoAuthorizer
+         POST:
+            Type: Api
+            Properties:
+              Path: /entitlement
+              RestApiId: !Ref SentinelConnectServiceApi
+              Method: POST
+              Auth:
+                Authorizer: SentinalConnectServiceCognitoAuthorizer
+              RequestParameters:
+              - method.request.header.authorization:
+                  Required: true
+              - method.request.header.guid:
+                  Required: true  
+         PUT:
+            Type: Api
+            Properties:
+              Path: /entitlement
+              RestApiId: !Ref SentinelConnectServiceApi
+              Method: PUT
+              RequestParameters:
+              - method.request.header.authorization:
+                  Required: true
+              - method.request.header.guid:
+                  Required: true
+              Auth:
+                Authorizer: SentinalConnectServiceCognitoAuthorizer
+         sync:
+            Type: Api
+            Properties:
+              Path: /sync
+              RestApiId: !Ref SentinelConnectServiceApi
+              Method: PATCH
+              RequestParameters:
+              - method.request.header.authorization:
+                  Required: true
+              - method.request.header.guid:
+                  Required: true
+              Auth:
+                Authorizer: SentinalConnectServiceCognitoAuthorizer
+       Environment:
+         Variables:
+          ActivateEntitlement: SentinelConnect-Service-ActivateEntitlement
+          CreateEntitlement: SentinelConnect-Service-CreateEntitlement
+          InputValidation: SentinelConnect-Service-ValidationEngine
+          LogGroupName: SentinelConnect
+          LogName: SentinelConnect
+          SoapRequest: /entitlement/soap
+          UpdateEntitlement: SentinelConnect-Service-UpdateEntitlement
+          ValidateAndSaveRequest: SentinelConnect-Service-PersistenceEngine
+
+  SentinelConnectServicePersistenceEngine:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-PersistenceEngine
+       Description: SentinelConnect-Service-PersistenceEngine
+       CodeUri: api/service/lambdas/SentinelConnect-Service-PersistenceEngine
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Layers:
+         - !Ref DependenciesLayer
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Environment:
+         Variables:
+            ClientTable: Client
+            MessageTable: Message
+            MessageTypeExternalIdIndex: MessageType-ExternalId-index
+            SystemTable: SystemConfig
+
+
+  SentinelConnectServiceUpdateEntitlement:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-UpdateEntitlement
+       Description: SentinelConnect-Service-UpdateEntitlement
+       CodeUri: api/service/lambdas/SentinelConnect-Service-UpdateEntitlement
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Layers:
+         - !Ref DependenciesLayer
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectServiceValidationEngine:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-ValidationEngine
+       Description: SentinelConnect-Service-ValidationEngine
+       CodeUri: api/service/lambdas/SentinelConnect-Service-ValidationEngine
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Layers:
+         - !Ref CustomerAndContactLayer
+         - !Ref DependenciesLayer
+         - !Ref ServicePartnerLayer
+         - !Ref ServiceProductLayer
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectServiceSOAP:
+     Type: 'AWS::Serverless::Function'
+     Properties:
+       FunctionName: SentinelConnect-Service-SOAP
+       Description: SentinelConnect-Service-SOAP function
+       CodeUri: api/service/lambdas/SentinelConnect-Service-SOAP
+       MemorySize: 128
+       Timeout: 20
+       Handler: index.handler
+       Runtime: nodejs12.x
+       Layers:
+         - !Ref DependenciesLayer
+       Tracing: Active
+       Role: !GetAtt SentinelConnectAccessRole.Arn
+       Events:
+         soapentitlement:
+           Type: Api
+           Properties:
+             Path: /entitlement/soap
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+             Auth:
+               Authorizer: SentinalConnectServiceCognitoAuthorizer
+         soapentitlementPOST:
+           Type: Api
+           Properties:
+             Path: /soap-entitlement
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+             Auth:
+               Authorizer: SentinalConnectServiceCognitoAuthorizer
+         soaptoken:
+           Type: Api
+           Properties:
+             Path: /soap-token
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+         soap:
+           Type: Api
+           Properties:
+             Path: /token/soap
+             RestApiId: !Ref SentinelConnectServiceApi
+             Method: POST
+       Environment:
+         Variables:
+            ExecutionFlow: SentinelConnect-Service-ExecutionFlow
+            Login: SentinelConnect-Authentication-Token  
+
+  
+  
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Admin Web UI Infrastructure                                                  #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+   
+  #S3 Bucket for Admin Portal
+  AdminPortalS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableWebUIBucketCreation
+    Properties:
+      AccessControl: PublicRead
+      BucketName: !Ref AdminWebUIBucketName
+      MetricsConfigurations:
+        - Id: EntireBucket
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+    DeletionPolicy: Retain
+
+  #S3 Bucket Policy
+  BucketPolicyPrivate:
+    Type: 'AWS::S3::BucketPolicy'
+    Condition: EnableWebUIBucketCreation
+    Properties:
+      Bucket: !Ref AdminWebUIBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Principal: '*'
+          Action: 's3:GetObject*'
+          Effect: Allow
+          Resource: !Sub '${AdminPortalS3Bucket.Arn}/*'
+
+  
+  #Web UI API Gateway - SentinelConnectWeb
+  SentinelConnectWebPortalRestApi:
+   Type: "AWS::ApiGateway::RestApi"
+   Properties:
+     Name: SentinelConnectWeb
+     Description: A REST API for Sentinel Connect Admin Portal
+     FailOnWarnings: true
+     EndpointConfiguration:
+       Types:
+         - REGIONAL 
+  
+  # Authorizer
+  SentinelConnectWebCognitoAuthorizer:
+     Type: AWS::ApiGateway::Authorizer
+     Properties:
+       Name: SentinelConnectWebAuthorizer
+       Type: COGNITO_USER_POOLS
+       IdentitySource: method.request.header.authorization
+       ProviderARNs:
+        - Fn::GetAtt:
+            - CognitoUserPool
+            - Arn
+       RestApiId: !Ref SentinelConnectWebPortalRestApi
+  
+  #Client Resource
+  ClientsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'clients'
+
+  #Client Resource Methods
+  ClientsMethodGet:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref ClientsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebListClients.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES     
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }  
+          }
+
+  ClientsMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: ClientsResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+
+  ClientsMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref ClientsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebCreateClient.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  
+  #Client/verifyemsdetails Resource
+  VerifyEMSDetailsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !Ref ClientsResource
+      PathPart: 'verifyemsdetails'
+
+  #Client/verifyemsdetails Resource Methods
+  VerifyEMSDetailsMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref VerifyEMSDetailsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebVerifyClientEMSDetails.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  VerifyEMSDetailsMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: VerifyEMSDetailsResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+
+  
+  #Dashboards Resource
+  DashboardsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'dashboards'
+
+  #Dashboard Resource Methods
+  DashboardsMethodGet:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref DashboardsResource
+      HttpMethod: GET 
+      RequestParameters:
+        method.request.querystring.timeStamp: true
+        method.request.querystring.client: true
+        method.request.querystring.date: true
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebGetChartData.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$'),\n",
+                    "\n    \"selectedClient\": \"$input.params(\"client\")\",\n",
+                    "\n    \"selectedDate\": \"$input.params(\"date\")\",\n",
+                    "\n    \"timeStamp\": \"$input.params(\"timeStamp\")\"}"
+                  ]
+               ]
+            }
+          }
+
+  DashboardsMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: DashboardsResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+
+  
+  #Token Resource
+  TokenResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'token'
+
+  #Token Resource Methods
+  TokenMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref TokenResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectAuthenticationToken.Arn"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200             
+
+  
+  #Transactions Resource
+  TransactionsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'transactions'
+  #Transaction Resource Methods
+  TransactionsMethodGet:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref TransactionsResource
+      HttpMethod: GET
+      RequestParameters:
+        method.request.querystring.timestamp: true
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebListTransactions.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$'),\n",
+                    "\n    \"time\": \"$input.params(\"timeStamp\")\"}"
+                  ]
+               ]
+            }
+          }
+
+  TransactionsMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref TransactionsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebListTransactions.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  TranasctionsMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: TransactionsResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+
+  
+  
+  # Transactions/Logs Resource
+  TranasctionLogsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !Ref TransactionsResource
+      PathPart: 'logs'
+  # Transactions/Logs Resource Methods
+  TranasctionLogsMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref TranasctionLogsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebTransactionLogs.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  TranasctionLogsMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: TranasctionLogsResource
+      AuthorizationType: NONE      
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+
+  
+  #Users Resource
+  UsersResources:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'users'
+  #Users Resource Methods
+  UsersMethodDelete:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref UsersResources
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+             method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebDeleteUser.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  UsersMethodGet:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref UsersResources
+      HttpMethod: GET
+      RequestParameters:
+        method.request.querystring.client: true
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebListUsers.Arn"  
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$'),\n",
+                    "\n    \"selectedClient\": \"$input.params(\"client\")\"}"
+                  ]
+               ]
+            }
+          }
+
+  UsersMethodPost:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref UsersResources
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebCreateUser.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  UsersMethodPut:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref UsersResources
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref SentinelConnectWebCognitoAuthorizer
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebUpdateUser.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        "RequestTemplates": {
+          "application/json": {
+              "Fn::Join": [
+                  "",
+                  [
+                    "{\n    \"method\": \"$context.httpMethod\",\n",
+                    "\n    \"claimsSub\": \"$context.authorizer.claims.sub\",\n",
+                    "\n    \"claimsUsername\": \"$context.authorizer.claims[\"cognito:username\"]\",\n",
+                    "\n    \"claimsRole\": \"$context.authorizer.claims[\"custom:Role\"]\",\n",
+                    "\n    \"claimsClientId\": \"$context.authorizer.claims[\"custom:ClientId\"]\",\n",
+                    "\n    \"body\": $input.json('$')}"
+                  ]
+               ]
+            }
+          }
+
+  UsersMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: UsersResources
+      AuthorizationType: NONE 
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+
+  #Swagger Resource
+
+  SwaggerResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ParentId: !GetAtt 
+        - SentinelConnectWebPortalRestApi
+        - RootResourceId
+      PathPart: 'swagger'
+
+  SwaggerMethodGet:
+    DependsOn: SentinelConnectWebPortalRestApi
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      ResourceId: !Ref SwaggerResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      MethodResponses:
+         - StatusCode: 200
+           ResponseModels: { "application/json": "Empty" }
+           ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "SentinelConnectWebSwaggerAPI.Arn"
+        PassthroughBehavior: WHEN_NO_TEMPLATES     
+        IntegrationResponses:
+          - ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+            ResponseParameters:          
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+
+  SwaggerMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: SentinelConnectWebPortalRestApi
+      ResourceId:
+        Ref: SwaggerResource
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{statusCode: 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false   
+
+    
+  
+  #Api Gateway Deployment
+  SentinelConnectApiGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      -  SentinelConnectWebPortalRestApi
+      -  ClientsMethodGet
+      -  ClientsMethodOptions
+      -  ClientsMethodPost
+      -  VerifyEMSDetailsMethodPost
+      -  VerifyEMSDetailsMethodOptions
+      -  DashboardsMethodGet
+      -  DashboardsMethodOptions
+      -  TokenMethodPost
+      -  TransactionsMethodGet
+      -  TransactionsMethodPost
+      -  TranasctionsMethodOptions
+      -  TranasctionLogsMethodPost
+      -  TranasctionLogsMethodOptions
+      -  UsersMethodDelete
+      -  UsersMethodGet
+      -  UsersMethodPost
+      -  UsersMethodPut
+      -  UsersMethodOptions
+      -  SwaggerMethodGet
+      -  SwaggerMethodOptions
+    Properties:
+      RestApiId: !Ref SentinelConnectWebPortalRestApi
+      StageName: !Ref AdminWebApiGatewayStageName
+      Description: "QA Deployment testing"
+   
+  #Web UI Lambdas
+  SentinelConnectWebListClients:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-ListClients
+      FunctionName: SentinelConnect-Web-ListClients
+      Description: SentinelConnect-Web-ListClients Function
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      
+  
+  SentinelConnectWebListClientsPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebListClients
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/GET/clients"
+        ]
+      ]
+
+  SentinelConnectWebVerifyClientEMSDetails:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-VerifyClientEMSDetails
+      FunctionName: SentinelConnect-Web-VerifyClientEMSDetails
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Layers:
+         - !Ref DependenciesLayer
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectWebVerifyClientEMSDetailsPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebVerifyClientEMSDetails
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/clients/verifyemsdetails"
+        ]
+      ]
+
+  SentinelConnectWebGetChartData:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-GetChartData
+      FunctionName: SentinelConnect-Web-GetChartData
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectWebGetChartDataPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebGetChartData
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/GET/dashboards"
+        ]
+      ]
+
+
+  SentinelConnectWebListTransactions:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-ListTransactions
+      FunctionName: SentinelConnect-Web-ListTransactions
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectWebListTransactionsPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebListTransactions
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/GET/transactions"
+        ]
+      ]
+
+  SentinelConnectWebListTransactionsPermissionsPost:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebListTransactions
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/transactions"
+        ]
+      ]
+
+
+  SentinelConnectWebTransactionLogs:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-TransactionLogs
+      FunctionName: SentinelConnect-Web-TransactionLogs
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Layers:
+         - !Ref DependenciesLayer
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          LogGroupName: SentinelConnect
+
+  SentinelConnectWebTransactionLogsPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebTransactionLogs
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/transactions/logs"
+        ]
+      ]
+
+   
+  SentinelConnectWebCreateClient:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-CreateClient
+      FunctionName: SentinelConnect-Web-CreateClient
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+
+  SentinelConnectWebCreateClientPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebCreateClient
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/clients"
+        ]
+      ]
+
+  SentinelConnectWebCreateUser:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-CreateUser
+      FunctionName: SentinelConnect-Web-CreateUser
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          ClientId: !Ref CognitoUserPoolClient
+          UserPoolId: !Ref CognitoUserPool
+
+  SentinelConnectWebCreateUserPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebCreateUser
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/users"
+        ]
+      ]
+
+  SentinelConnectWebDeleteUser:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-DeleteUser
+      FunctionName: SentinelConnect-Web-DeleteUser
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15 
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          ClientTable: Client
+          ServiceAccountIdIndex: Region-ServiceAccountId-index
+          userPoolId: !Ref CognitoUserPool
+
+  SentinelConnectWebDeleteUserPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebDeleteUser
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/DELETE/users"
+        ]
+      ]
+
+
+  SentinelConnectWebUpdateUser:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-UpdateUser
+      FunctionName: SentinelConnect-Web-UpdateUser
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn 
+      Environment:
+        Variables:
+          UserPoolId: !Ref CognitoUserPool
+
+  SentinelConnectWebUpdateUserPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebUpdateUser
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/PUT/users"
+        ]
+      ]
+
+  SentinelConnectWebListUsers:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/web/lambdas/SentinelConnect-Web-ListUsers
+      FunctionName: SentinelConnect-Web-ListUsers
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          UserPoolId: !Ref CognitoUserPool
+
+  SentinelConnectWebListUsersPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebListUsers
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/GET/users"
+        ]
+      ]
+
+  
+
+        #Web Token
+  SentinelConnectAuthenticationToken:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: api/misc/SentinelConnect-Authentication-Token
+      FunctionName: SentinelConnect-Authentication-Token
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          UserPoolId: !Ref CognitoUserPool 
+          ClientId: !Ref CognitoUserPoolClient
+     
+  SentinelConnectAuthenticationTokenPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectAuthenticationToken
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/POST/token"
+        ]
+      ]
+  
+
+  #Swagger
+  SentinelConnectWebSwaggerAPI:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      FunctionName: SentinelConnect-Web-SwaggerAPI
+      CodeUri: api/web/lambdas/SentinelConnect-Web-SwaggerAPI
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+      Environment:
+        Variables:
+          Endpoint: !Join [
+            "", [
+              "https://",  
+              !Ref SentinelConnectServiceApi,
+              ".execute-api.",
+              {"Ref": "AWS::Region"},
+              ".amazonaws.com/v1"            
+            ]
+          ]
+          EnviromentDescription: v1 Environment
+          Version: v1
+
+
+  SentinelConnectSwaggerAPIPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - SentinelConnectWebSwaggerAPI
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join [
+        "", [
+          "arn:aws:execute-api:",
+          {"Ref": "AWS::Region"}, ":",
+          {"Ref": "AWS::AccountId"}, ":",
+          !Ref SentinelConnectWebPortalRestApi, "/*/GET/swagger"
+        ]
+      ]
+
+  #Sentinel Connect Default Admin User
+  SentinelConnectSAMCreateAdmin:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      FunctionName: SentinelConnect-SAM-CreateAdmin
+      CodeUri: api/misc/SentinelConnect-SAM-CreateAdmin
+      Handler: index.handler
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt SentinelConnectAccessRole.Arn
+ 
+  SentinelConnectSAMCreateAdminLambdaInvoker:
+    Type: Custom::LambdaInvoker
+    DependsOn: SentinelConnectSAMCreateAdmin
+    Version: "1.0"
+    Properties:
+       ServiceToken: !GetAtt SentinelConnectSAMCreateAdmin.Arn
+       body:
+         {
+             "UserPoolId": !Ref CognitoUserPool,
+             "UserName": !Ref UserName,
+             "Email": !Ref Email,
+             "Phone": !Ref PhoneNo,
+             "Name": !Ref Name,
+             "TableName": !Ref TableName
+         }
+
+  
+  ########################################################################################################################################################
+  #                                                                                                                                                      # 
+  #                                                        Sentinel Connect Outputs                                                                      #
+  #                                                                                                                                                      #
+  ########################################################################################################################################################
+  
+Outputs:
+  Region:
+    Description: "Region"
+    Value: !Ref AWS::Region
+
+  CognitoUserPoolId:
+    Description: "Cognito User Pool Id"
+    Value: !Ref CognitoUserPool
+
+  CognitoUserPoolClientId:
+    Description: "Cognito User Pool Client Id"
+    Value: !Ref CognitoUserPoolClient
+
+  CognitoIdentityPoolId:
+    Description: "Cognito Identity Pool Id"
+    Value: !Ref CognitoIdentityPool
+
+  WebsiteURL:
+    Value: !GetAtt [AdminPortalS3Bucket, WebsiteURL]
+    Description: URL for website hosted on S3
+    Condition: EnableWebUIBucketCreation    
+
+  S3BucketSecureURL:
+    Value: !Join ["", ["https://", !GetAtt [AdminPortalS3Bucket, DomainName]]]
+    Description: Name of S3 bucket to hold website content
+    Condition: EnableWebUIBucketCreation
